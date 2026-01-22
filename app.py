@@ -4,122 +4,136 @@ import pandas as pd
 import librosa
 import soundfile as sf
 import joblib
-from scipy.signal import butter, lfilter
+import tempfile
+from scipy.stats import skew, kurtosis
 
 # ===============================
 # Constants (MUST match training)
 # ===============================
 TARGET_SR = 16000
-FIXED_DURATION = 2.5  # seconds
+FIXED_DUR = 2.5
 N_MFCC = 20
 
 # ===============================
-# Load model
+# Load model artifacts
 # ===============================
 @st.cache_resource
 def load_artifacts():
-    artifact = joblib.load("xgb_model.joblib")
+    artifact = joblib.load("model_artifact.pkl")  # <-- نفس الاسم اللي حفظتيه
     return (
         artifact["model"],
         artifact["label_encoder"],
-        artifact["top_features"]
+        artifact["top_features"],
+        artifact["target_sr"],
+        artifact["fixed_dur"],
     )
 
-model, label_encoder, top_features = load_artifacts()
+model, label_encoder, top_features, TARGET_SR, FIXED_DUR = load_artifacts()
 
 # ===============================
-# Audio preprocessing
+# Audio preprocessing (same as training)
 # ===============================
-def butter_highpass(cutoff, fs, order=5):
-    nyq = 0.5 * fs
-    normal_cutoff = cutoff / nyq
-    b, a = butter(order, normal_cutoff, btype="high", analog=False)
-    return b, a
-
-def highpass_filter(data, cutoff=60, fs=16000, order=5):
-    b, a = butter_highpass(cutoff, fs, order=order)
-    return lfilter(b, a, data)
+def fix_length_center(y: np.ndarray, sr: int, fixed_dur: float) -> np.ndarray:
+    L = int(round(fixed_dur * sr))
+    if len(y) < L:
+        return np.pad(y, (0, L - len(y)))
+    start = (len(y) - L) // 2
+    return y[start:start + L]
 
 def preprocess_audio(y, sr):
-    # Stereo → Mono
     if y.ndim > 1:
         y = np.mean(y, axis=1)
 
-    # Resample
     if sr != TARGET_SR:
         y = librosa.resample(y, orig_sr=sr, target_sr=TARGET_SR)
-        sr = TARGET_SR
 
-    # Trim silence
     y, _ = librosa.effects.trim(y, top_db=25)
 
-    # High-pass filter
-    y = highpass_filter(y, fs=sr)
+    mx = np.max(np.abs(y)) + 1e-8
+    y = (y / mx).astype(np.float32)
 
-    # Normalize [-1, 1]
-    if np.max(np.abs(y)) > 0:
-        y = y / np.max(np.abs(y))
-
-    # Fix length (pad / truncate)
-    target_len = int(FIXED_DURATION * sr)
-    if len(y) < target_len:
-        y = np.pad(y, (0, target_len - len(y)))
-    else:
-        y = y[:target_len]
-
+    y = fix_length_center(y, TARGET_SR, FIXED_DUR)
     return y
 
 # ===============================
-# Feature extraction
+# Feature extraction (IDENTICAL)
 # ===============================
-def extract_features(y, sr=TARGET_SR):
-    features = {}
+def pre_emphasis(y: np.ndarray, coeff: float = 0.97) -> np.ndarray:
+    return np.append(y[0], y[1:] - coeff * y[:-1])
 
-    # MFCC
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=N_MFCC)
+def robust_stats(x: np.ndarray, prefix: str) -> dict:
+    x = np.asarray(x)
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return {f"{prefix}_{k}": 0.0 for k in
+                ["mean","std","skew","kurt","p10","p25","p50","p75","p90"]}
+    return {
+        f"{prefix}_mean": float(np.mean(x)),
+        f"{prefix}_std":  float(np.std(x)),
+        f"{prefix}_skew": float(skew(x)),
+        f"{prefix}_kurt": float(kurtosis(x)),
+        f"{prefix}_p10":  float(np.percentile(x, 10)),
+        f"{prefix}_p25":  float(np.percentile(x, 25)),
+        f"{prefix}_p50":  float(np.percentile(x, 50)),
+        f"{prefix}_p75":  float(np.percentile(x, 75)),
+        f"{prefix}_p90":  float(np.percentile(x, 90)),
+    }
+
+def extract_voice_features(y: np.ndarray) -> dict:
+    y = pre_emphasis(y)
+
+    feats = {}
+
+    rms = librosa.feature.rms(y=y)[0]
+    zcr = librosa.feature.zero_crossing_rate(y)[0]
+    feats.update(robust_stats(rms, "rms"))
+    feats.update(robust_stats(zcr, "zcr"))
+
+    centroid  = librosa.feature.spectral_centroid(y=y, sr=TARGET_SR)[0]
+    bandwidth = librosa.feature.spectral_bandwidth(y=y, sr=TARGET_SR)[0]
+    rolloff   = librosa.feature.spectral_rolloff(y=y, sr=TARGET_SR, roll_percent=0.85)[0]
+    flatness  = librosa.feature.spectral_flatness(y=y)[0]
+    feats.update(robust_stats(centroid,  "centroid"))
+    feats.update(robust_stats(bandwidth, "bandwidth"))
+    feats.update(robust_stats(rolloff,   "rolloff"))
+    feats.update(robust_stats(flatness,  "flatness"))
+
+    mfcc = librosa.feature.mfcc(y=y, sr=TARGET_SR, n_mfcc=N_MFCC)
+    d1   = librosa.feature.delta(mfcc)
+    d2   = librosa.feature.delta(mfcc, order=2)
+
     for i in range(N_MFCC):
-        features[f"mfcc_{i+1}_mean"] = np.mean(mfcc[i])
-        features[f"mfcc_{i+1}_std"] = np.std(mfcc[i])
+        feats.update(robust_stats(mfcc[i], f"mfcc{i:02d}"))
+        feats.update(robust_stats(d1[i],   f"mfcc{i:02d}_d1"))
+        feats.update(robust_stats(d2[i],   f"mfcc{i:02d}_d2"))
 
-    # Delta MFCC
-    delta = librosa.feature.delta(mfcc)
-    for i in range(N_MFCC):
-        features[f"delta_mfcc_{i+1}_mean"] = np.mean(delta[i])
-        features[f"delta_mfcc_{i+1}_std"] = np.std(delta[i])
+    f0 = librosa.yin(y, fmin=70, fmax=400, sr=TARGET_SR)
+    f0 = f0[np.isfinite(f0)]
+    feats.update(robust_stats(f0, "f0"))
 
-    # Pitch (F0)
-    f0, _, _ = librosa.pyin(
-        y,
-        fmin=librosa.note_to_hz("C2"),
-        fmax=librosa.note_to_hz("C7")
-    )
-    f0 = f0[~np.isnan(f0)]
-    features["pitch_mean"] = np.mean(f0) if len(f0) else 0
-    features["pitch_std"] = np.std(f0) if len(f0) else 0
+    if f0.size > 2:
+        f0_diff = np.abs(np.diff(f0))
+        feats["jitter_rel_mean"] = float(np.mean(f0_diff) / (np.mean(f0) + 1e-8))
+        feats["jitter_rel_std"]  = float(np.std(f0_diff)  / (np.mean(f0) + 1e-8))
+    else:
+        feats["jitter_rel_mean"] = 0.0
+        feats["jitter_rel_std"]  = 0.0
 
-    # Spectral features
-    features["spectral_centroid"] = np.mean(
-        librosa.feature.spectral_centroid(y=y, sr=sr)
-    )
-    features["spectral_bandwidth"] = np.mean(
-        librosa.feature.spectral_bandwidth(y=y, sr=sr)
-    )
-    features["spectral_rolloff"] = np.mean(
-        librosa.feature.spectral_rolloff(y=y, sr=sr)
-    )
+    y_h, y_p = librosa.effects.hpss(y)
+    harm_energy = float(np.mean(y_h ** 2))
+    perc_energy = float(np.mean(y_p ** 2))
+    feats["harm_energy"] = harm_energy
+    feats["perc_energy"] = perc_energy
+    feats["harm_perc_ratio"] = float((harm_energy + 1e-8) / (perc_energy + 1e-8))
 
-    # Energy
-    features["rms_energy"] = np.mean(librosa.feature.rms(y=y))
-
-    return features
+    return feats
 
 # ===============================
 # Streamlit UI
 # ===============================
-st.set_page_config(page_title="Speech Disorder Classification", layout="centered")
-
+st.set_page_config(page_title="Speech Disorder Classifier", layout="centered")
 st.title("🗣️ Speech Disorder Classification")
-st.write("Upload a WAV file to classify speech condition")
+st.write("Upload a WAV file and get prediction probabilities")
 
 uploaded_file = st.file_uploader("Upload WAV file", type=["wav"])
 
@@ -127,12 +141,25 @@ if uploaded_file is not None:
     with st.spinner("Processing audio..."):
         y, sr = sf.read(uploaded_file)
         y = preprocess_audio(y, sr)
-        features = extract_features(y)
 
-        X = pd.DataFrame([features])
-        X = X[top_features]  # IMPORTANT: same feature order
+        feats = extract_voice_features(y)
+        X = pd.DataFrame([feats])
 
-        prediction = model.predict(X)
-        label = label_encoder.inverse_transform(prediction)[0]
+        # ⭐ THE MAGIC LINE (no KeyError ever)
+        X = X.reindex(columns=top_features, fill_value=0.0)
+
+        probs = model.predict_proba(X)[0]
+        pred_idx = int(np.argmax(probs))
+        label = label_encoder.inverse_transform([pred_idx])[0]
 
     st.success(f"### 🧠 Prediction: **{label}**")
+
+    st.subheader("Prediction probabilities")
+    prob_df = pd.DataFrame({
+        "Class": label_encoder.classes_,
+        "Probability": probs
+    }).sort_values("Probability", ascending=False)
+
+    st.dataframe(prob_df, use_container_width=True)
+
+
