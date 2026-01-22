@@ -108,7 +108,7 @@ def extract_features_from_audio(y: np.ndarray) -> dict:
 
     # Time-domain
     rms = librosa.feature.rms(y=y)[0]
-    zcr = librosa.feature.zero_crossing_rate(y)[0]
+    zcr = librosa.feature.zero_crossing_rate(y=y)[0]
     feats.update(robust_stats(rms, "rms"))
     feats.update(robust_stats(zcr, "zcr"))
 
@@ -176,7 +176,7 @@ if uploaded_files and patient_name:
             y, sr, logmel = preprocess_audio(str(fp))
 
             # Save cleaned WAV and log-mel
-            out_base = f"{idx:05d}_{patient_name}_{uploaded_file.stem}"
+            out_base = f"{idx:05d}_{patient_name}_{Path(uploaded_file.name).stem}"  # ✅ صححت هنا
             out_wav = WAV_DIR / f"{out_base}.wav"
             out_mel = MEL_DIR / f"{out_base}.npy"
             sf.write(out_wav, y, sr)
