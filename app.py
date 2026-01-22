@@ -6,7 +6,9 @@ import soundfile as sf
 import joblib
 from pathlib import Path
 from scipy.stats import skew, kurtosis
+from pydub import AudioSegment
 import io
+import tempfile
 
 # ===============================
 # Constants
@@ -149,17 +151,20 @@ def extract_features_from_audio(y: np.ndarray) -> dict:
 st.set_page_config(page_title="Speech Disorder Classification", layout="centered")
 st.title("🗣️ Speech Disorder Classification")
 
-uploaded_file = st.file_uploader("Upload an audio file (WAV, MP3, AAC, FLAC, etc.)", type=None)
+uploaded_file = st.file_uploader("Upload any audio file (WAV, MP3, AAC, M4A, FLAC, etc.)", type=None)
 patient_name = st.text_input("Enter patient name:")
 
 if uploaded_file and patient_name:
-    # تحويل أي ملف صوتي لـ WAV تلقائيًا
+    # تحويل أي ملف صوتي إلى WAV باستخدام pydub
     audio_bytes = io.BytesIO(uploaded_file.read())
-    y, sr = librosa.load(audio_bytes, sr=None, mono=True)
-
-    out_base = f"{patient_name}_{Path(uploaded_file.name).stem}"
-    out_wav = WAV_DIR / f"{out_base}.wav"
-    sf.write(out_wav, y, sr)
+    with tempfile.NamedTemporaryFile(suffix=Path(uploaded_file.name).suffix) as tmp:
+        tmp.write(audio_bytes.read())
+        tmp.flush()
+        audio_seg = AudioSegment.from_file(tmp.name)
+        # Save as WAV
+        out_base = f"{patient_name}_{Path(uploaded_file.name).stem}"
+        out_wav = WAV_DIR / f"{out_base}.wav"
+        audio_seg.export(out_wav, format="wav")
 
     # preprocessing و log-mel
     y, sr, logmel = preprocess_audio(str(out_wav))
@@ -186,3 +191,5 @@ if uploaded_file and patient_name:
     st.write("**Probabilities:**")
     for label, prob in zip(label_encoder.classes_, probas):
         st.write(f"{label}: {prob*100:.1f}%")
+
+   
