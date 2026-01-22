@@ -6,14 +6,12 @@ import soundfile as sf
 import joblib
 from pathlib import Path
 from scipy.stats import skew, kurtosis
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.utils.class_weight import compute_sample_weight
 
 # ===============================
-# Constants (match training)
+# Constants
 # ===============================
 TARGET_SR = 16000
-FIXED_DUR = 2.5  # seconds
+FIXED_DUR = 2.5
 N_MELS    = 80
 N_FFT     = 1024
 HOP       = 256
@@ -62,16 +60,9 @@ def preprocess_audio(fp: str) -> tuple[np.ndarray, int, np.ndarray]:
     if sr0 != TARGET_SR:
         y = librosa.resample(y, orig_sr=sr0, target_sr=TARGET_SR)
 
-    # trim silence
     y, _ = librosa.effects.trim(y, top_db=25)
-
-    # normalize
     y = y / (np.max(np.abs(y)) + 1e-8)
-
-    # fixed duration
     y = fix_length_center(y, TARGET_SR, FIXED_DUR)
-
-    # compute log-mel
     logmel = compute_logmel(y, TARGET_SR)
 
     return y, TARGET_SR, logmel
@@ -103,7 +94,6 @@ def extract_features_from_audio(y: np.ndarray) -> dict:
     y = y.astype(np.float32)
     y = y / (np.max(np.abs(y)) + 1e-8)
     y = pre_emphasis(y)
-
     feats = {}
 
     # Time-domain
@@ -161,45 +151,39 @@ def extract_features_from_audio(y: np.ndarray) -> dict:
 st.set_page_config(page_title="Speech Disorder Classification", layout="centered")
 st.title("🗣️ Speech Disorder Classification")
 
+uploaded_file = st.file_uploader("Upload a WAV or audio file", type=["wav","mp3","flac"])
 patient_name = st.text_input("Enter patient name:")
-uploaded_files = st.file_uploader("Upload WAV files", type=["wav"], accept_multiple_files=True)
 
-if uploaded_files and patient_name:
-    results = []
-    for idx, uploaded_file in enumerate(uploaded_files):
-        with st.spinner(f"Processing {uploaded_file.name}..."):
-            fp = Path("uploads") / uploaded_file.name
-            fp.parent.mkdir(parents=True, exist_ok=True)
-            with open(fp, "wb") as f:
-                f.write(uploaded_file.getbuffer())
+if uploaded_file and patient_name:
+    fp = Path("uploads") / uploaded_file.name
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    with open(fp, "wb") as f:
+        f.write(uploaded_file.getbuffer())
 
-            y, sr, logmel = preprocess_audio(str(fp))
+    y, sr, logmel = preprocess_audio(str(fp))
 
-            # Save cleaned WAV and log-mel
-            out_base = f"{idx:05d}_{patient_name}_{Path(uploaded_file.name).stem}"  # ✅ صححت هنا
-            out_wav = WAV_DIR / f"{out_base}.wav"
-            out_mel = MEL_DIR / f"{out_base}.npy"
-            sf.write(out_wav, y, sr)
-            np.save(out_mel, logmel)
+    # Save cleaned WAV and log-mel
+    out_base = f"{patient_name}_{Path(uploaded_file.name).stem}"
+    out_wav = WAV_DIR / f"{out_base}.wav"
+    out_mel = MEL_DIR / f"{out_base}.npy"
+    sf.write(out_wav, y, sr)
+    np.save(out_mel, logmel)
 
-            features = extract_features_from_audio(y)
-            X = pd.DataFrame([features])
-            for col in top_features:
-                if col not in X.columns:
-                    X[col] = 0.0
-            X = X[top_features]
+    features = extract_features_from_audio(y)
+    X = pd.DataFrame([features])
+    for col in top_features:
+        if col not in X.columns:
+            X[col] = 0.0
+    X = X[top_features]
 
-            probas = model.predict_proba(X)[0]
-            pred_idx = np.argmax(probas)
-            pred_label = label_encoder.inverse_transform([pred_idx])[0]
+    probas = model.predict_proba(X)[0]
+    pred_idx = np.argmax(probas)
+    pred_label = label_encoder.inverse_transform([pred_idx])[0]
 
-            results.append({"file": uploaded_file.name, "prediction": pred_label, "probas": probas})
-
-    st.markdown(f"## Results for **{patient_name}**")
-    for res in results:
-        st.write(f"**File:** {res['file']}")
-        st.write(f"**Prediction:** {res['prediction']}")
-        for label, prob in zip(label_encoder.classes_, res["probas"]):
-            st.progress(int(prob*100))
-            st.write(f"{label}: {prob*100:.1f}%")
-        st.write("---")
+    # Display result only (no plots)
+    st.markdown(f"## Prediction for **{patient_name}**")
+    st.write(f"**File:** {uploaded_file.name}")
+    st.write(f"**Predicted label:** {pred_label}")
+    st.write("**Probabilities:**")
+    for label, prob in zip(label_encoder.classes_, probas):
+        st.write(f"{label}: {prob*100:.1f}%")
