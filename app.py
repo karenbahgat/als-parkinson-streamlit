@@ -7,6 +7,19 @@ import joblib
 import os
 from scipy.signal import butter, lfilter
 
+X = pd.DataFrame([features])
+
+# ===========================
+# Align columns with training features
+# ===========================
+for col in top_features:
+    if col not in X.columns:
+        X[col] = 0.0
+
+# Reorder columns exactly as in top_features
+X = X[top_features]
+
+
 # ===============================
 # Constants
 # ===============================
