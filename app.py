@@ -4,133 +4,202 @@ import pandas as pd
 import librosa
 import soundfile as sf
 import joblib
-import os
-from scipy.signal import butter, lfilter
-
-X = pd.DataFrame([features])
-
-# ===========================
-# Align columns with training features
-# ===========================
-for col in top_features:
-    if col not in X.columns:
-        X[col] = 0.0
-
-# Reorder columns exactly as in top_features
-X = X[top_features]
-
+from pathlib import Path
+from scipy.stats import skew, kurtosis
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.utils.class_weight import compute_sample_weight
 
 # ===============================
-# Constants
+# Constants (match training)
 # ===============================
 TARGET_SR = 16000
-FIXED_DUR = 2.5
-N_MFCC = 20
+FIXED_DUR = 2.5  # seconds
+N_MELS    = 80
+N_FFT     = 1024
+HOP       = 256
+FMIN      = 50
+FMAX      = TARGET_SR // 2
+N_MFCC    = 20
+
+WAV_DIR = Path("processed") / "wav_clean"
+MEL_DIR = Path("processed") / "logmel_clean"
+WAV_DIR.mkdir(parents=True, exist_ok=True)
+MEL_DIR.mkdir(parents=True, exist_ok=True)
 
 # ===============================
-# Load model
+# Load model artifacts
 # ===============================
 @st.cache_resource
 def load_artifacts():
-    if not os.path.exists("xgb_model.joblib"):
-        st.error("❌ Model file xgb_model.joblib not found!")
-        st.stop()
     artifact = joblib.load("xgb_model.joblib")
     return artifact["model"], artifact["label_encoder"], artifact["top_features"]
 
 model, label_encoder, top_features = load_artifacts()
 
 # ===============================
-# Audio preprocessing
+# Audio preprocessing functions
 # ===============================
-def butter_highpass(cutoff, fs, order=5):
-    nyq = 0.5 * fs
-    normal_cutoff = cutoff / nyq
-    b, a = butter(order, normal_cutoff, btype="high", analog=False)
-    return b, a
-
-def highpass_filter(data, cutoff=60, fs=TARGET_SR, order=5):
-    b, a = butter_highpass(cutoff, fs, order=order)
-    return lfilter(b, a, data)
-
-def fix_length_center(y, sr, fixed_dur):
+def fix_length_center(y: np.ndarray, sr: int, fixed_dur: float) -> np.ndarray:
     L = int(round(fixed_dur * sr))
     if len(y) < L:
         return np.pad(y, (0, L-len(y)))
     start = (len(y) - L) // 2
     return y[start:start+L]
 
-def preprocess_audio(y, sr):
-    if y.ndim > 1:
-        y = np.mean(y, axis=1)
-    if sr != TARGET_SR:
-        y = librosa.resample(y, orig_sr=sr, target_sr=TARGET_SR)
-        sr = TARGET_SR
+def compute_logmel(y: np.ndarray, sr: int) -> np.ndarray:
+    S = librosa.feature.melspectrogram(
+        y=y, sr=sr,
+        n_fft=N_FFT, hop_length=HOP,
+        n_mels=N_MELS, fmin=FMIN, fmax=FMAX,
+        power=2.0
+    )
+    return librosa.power_to_db(S, ref=np.max).astype(np.float32)
+
+def preprocess_audio(fp: str) -> tuple[np.ndarray, int, np.ndarray]:
+    y, sr0 = librosa.load(fp, sr=None, mono=True)
+    y = y.astype(np.float32)
+
+    if sr0 != TARGET_SR:
+        y = librosa.resample(y, orig_sr=sr0, target_sr=TARGET_SR)
+
+    # trim silence
     y, _ = librosa.effects.trim(y, top_db=25)
-    y = highpass_filter(y, fs=sr)
-    if np.max(np.abs(y)) > 0:
-        y = y / np.max(np.abs(y))
-    y = fix_length_center(y, sr, FIXED_DUR)
-    return y
+
+    # normalize
+    y = y / (np.max(np.abs(y)) + 1e-8)
+
+    # fixed duration
+    y = fix_length_center(y, TARGET_SR, FIXED_DUR)
+
+    # compute log-mel
+    logmel = compute_logmel(y, TARGET_SR)
+
+    return y, TARGET_SR, logmel
 
 # ===============================
-# Feature extraction
+# Feature extraction functions
 # ===============================
-def extract_features(y, sr=TARGET_SR):
-    features = {}
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=N_MFCC)
-    delta1 = librosa.feature.delta(mfcc)
-    delta2 = librosa.feature.delta(mfcc, order=2)
+def pre_emphasis(y: np.ndarray, coeff: float = 0.97) -> np.ndarray:
+    return np.append(y[0], y[1:] - coeff * y[:-1])
+
+def robust_stats(x: np.ndarray, prefix: str) -> dict:
+    x = np.asarray(x)
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return {f"{prefix}_{k}": 0.0 for k in ["mean","std","skew","kurt","p10","p25","p50","p75","p90"]}
+    return {
+        f"{prefix}_mean": float(np.mean(x)),
+        f"{prefix}_std":  float(np.std(x)),
+        f"{prefix}_skew": float(skew(x)),
+        f"{prefix}_kurt": float(kurtosis(x)),
+        f"{prefix}_p10":  float(np.percentile(x, 10)),
+        f"{prefix}_p25":  float(np.percentile(x, 25)),
+        f"{prefix}_p50":  float(np.percentile(x, 50)),
+        f"{prefix}_p75":  float(np.percentile(x, 75)),
+        f"{prefix}_p90":  float(np.percentile(x, 90)),
+    }
+
+def extract_features_from_audio(y: np.ndarray) -> dict:
+    y = y.astype(np.float32)
+    y = y / (np.max(np.abs(y)) + 1e-8)
+    y = pre_emphasis(y)
+
+    feats = {}
+
+    # Time-domain
+    rms = librosa.feature.rms(y=y)[0]
+    zcr = librosa.feature.zero_crossing_rate(y)[0]
+    feats.update(robust_stats(rms, "rms"))
+    feats.update(robust_stats(zcr, "zcr"))
+
+    # Spectral
+    centroid  = librosa.feature.spectral_centroid(y=y, sr=TARGET_SR)[0]
+    bandwidth = librosa.feature.spectral_bandwidth(y=y, sr=TARGET_SR)[0]
+    rolloff   = librosa.feature.spectral_rolloff(y=y, sr=TARGET_SR, roll_percent=0.85)[0]
+    flatness  = librosa.feature.spectral_flatness(y=y)[0]
+    feats.update(robust_stats(centroid,  "centroid"))
+    feats.update(robust_stats(bandwidth, "bandwidth"))
+    feats.update(robust_stats(rolloff,   "rolloff"))
+    feats.update(robust_stats(flatness,  "flatness"))
+
+    # MFCC + deltas + delta-deltas
+    mfcc = librosa.feature.mfcc(y=y, sr=TARGET_SR, n_mfcc=N_MFCC)
+    d1   = librosa.feature.delta(mfcc)
+    d2   = librosa.feature.delta(mfcc, order=2)
     for i in range(N_MFCC):
-        features[f"mfcc_{i+1}_mean"] = np.mean(mfcc[i])
-        features[f"mfcc_{i+1}_std"] = np.std(mfcc[i])
-        features[f"delta_mfcc_{i+1}_mean"] = np.mean(delta1[i])
-        features[f"delta_mfcc_{i+1}_std"] = np.std(delta1[i])
-        features[f"delta2_mfcc_{i+1}_mean"] = np.mean(delta2[i])
-        features[f"delta2_mfcc_{i+1}_std"] = np.std(delta2[i])
-    f0, _, _ = librosa.pyin(y, fmin=70, fmax=400)
-    f0 = f0[~np.isnan(f0)]
-    features["pitch_mean"] = np.mean(f0) if len(f0) else 0
-    features["pitch_std"] = np.std(f0) if len(f0) else 0
-    features["rms_energy"] = np.mean(librosa.feature.rms(y=y))
-    return features
+        feats.update(robust_stats(mfcc[i], f"mfcc{i:02d}"))
+        feats.update(robust_stats(d1[i],   f"mfcc{i:02d}_d1"))
+        feats.update(robust_stats(d2[i],   f"mfcc{i:02d}_d2"))
+
+    # Pitch via YIN
+    f0 = librosa.yin(y, fmin=70, fmax=400, sr=TARGET_SR)
+    f0 = f0[np.isfinite(f0)]
+    feats.update(robust_stats(f0, "f0"))
+
+    # Jitter proxy
+    if f0.size > 2:
+        f0_diff = np.abs(np.diff(f0))
+        feats["jitter_rel_mean"] = float(np.mean(f0_diff) / (np.mean(f0) + 1e-8))
+        feats["jitter_rel_std"]  = float(np.std(f0_diff)  / (np.mean(f0) + 1e-8))
+    else:
+        feats["jitter_rel_mean"] = 0.0
+        feats["jitter_rel_std"]  = 0.0
+
+    # HNR proxy
+    y_h, y_p = librosa.effects.hpss(y)
+    harm_energy = float(np.mean(y_h**2))
+    perc_energy = float(np.mean(y_p**2))
+    feats["harm_energy"] = harm_energy
+    feats["perc_energy"] = perc_energy
+    feats["harm_perc_ratio"] = float((harm_energy + 1e-8) / (perc_energy + 1e-8))
+
+    return feats
 
 # ===============================
 # Streamlit UI
 # ===============================
-st.set_page_config(page_title="Speech Disorder Classifier", layout="centered")
-st.title("🗣️ Speech Disorder Classifier")
+st.set_page_config(page_title="Speech Disorder Classification", layout="centered")
+st.title("🗣️ Speech Disorder Classification")
 
-patient_name = st.text_input("Patient Name")
-uploaded_file = st.file_uploader("Upload WAV file", type=["wav"])
+patient_name = st.text_input("Enter patient name:")
+uploaded_files = st.file_uploader("Upload WAV files", type=["wav"], accept_multiple_files=True)
 
-if uploaded_file is not None:
-    y, sr = sf.read(uploaded_file)
-    duration = len(y)/sr
-    st.write(f"Audio duration: {duration:.2f} seconds")
-    if duration < 1.25:
-        st.warning(f"⚠️ Audio too short ({duration:.2f}s). Results may be unreliable.")
-    
-    with st.spinner("Processing audio..."):
-        y = preprocess_audio(y, sr)
-        features = extract_features(y)
-        X = pd.DataFrame([features])
-        X = X[top_features]
-        probs = model.predict_proba(X)[0]
-        pred_idx = np.argmax(probs)
-        pred_label = label_encoder.inverse_transform([pred_idx])[0]
+if uploaded_files and patient_name:
+    results = []
+    for idx, uploaded_file in enumerate(uploaded_files):
+        with st.spinner(f"Processing {uploaded_file.name}..."):
+            fp = Path("uploads") / uploaded_file.name
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            with open(fp, "wb") as f:
+                f.write(uploaded_file.getbuffer())
 
-    st.success(f"### 🧠 Prediction for {patient_name if patient_name else 'Patient'}: **{pred_label}**")
+            y, sr, logmel = preprocess_audio(str(fp))
 
-    # Probability bars with colors
-    prob_df = pd.DataFrame({
-        "Class": label_encoder.classes_,
-        "Probability": probs
-    })
-    prob_df = prob_df.set_index("Class")
-    st.bar_chart(prob_df)
+            # Save cleaned WAV and log-mel
+            out_base = f"{idx:05d}_{patient_name}_{uploaded_file.stem}"
+            out_wav = WAV_DIR / f"{out_base}.wav"
+            out_mel = MEL_DIR / f"{out_base}.npy"
+            sf.write(out_wav, y, sr)
+            np.save(out_mel, logmel)
 
-    # Show exact probabilities
-    st.subheader("Probabilities")
-    for c, p in zip(label_encoder.classes_, probs):
-        st.write(f"{c}: {p*100:.2f}%")
+            features = extract_features_from_audio(y)
+            X = pd.DataFrame([features])
+            for col in top_features:
+                if col not in X.columns:
+                    X[col] = 0.0
+            X = X[top_features]
+
+            probas = model.predict_proba(X)[0]
+            pred_idx = np.argmax(probas)
+            pred_label = label_encoder.inverse_transform([pred_idx])[0]
+
+            results.append({"file": uploaded_file.name, "prediction": pred_label, "probas": probas})
+
+    st.markdown(f"## Results for **{patient_name}**")
+    for res in results:
+        st.write(f"**File:** {res['file']}")
+        st.write(f"**Prediction:** {res['prediction']}")
+        for label, prob in zip(label_encoder.classes_, res["probas"]):
+            st.progress(int(prob*100))
+            st.write(f"{label}: {prob*100:.1f}%")
+        st.write("---")
