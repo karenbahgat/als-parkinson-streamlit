@@ -6,6 +6,3 @@ soundfile
 scipy
 scikit-learn
 xgboost
-joblib
-pydub
-ffmpeg-python
