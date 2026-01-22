@@ -6,6 +6,7 @@ import soundfile as sf
 import joblib
 from pathlib import Path
 from scipy.stats import skew, kurtosis
+import io
 
 # ===============================
 # Constants
@@ -56,15 +57,12 @@ def compute_logmel(y: np.ndarray, sr: int) -> np.ndarray:
 def preprocess_audio(fp: str) -> tuple[np.ndarray, int, np.ndarray]:
     y, sr0 = librosa.load(fp, sr=None, mono=True)
     y = y.astype(np.float32)
-
     if sr0 != TARGET_SR:
         y = librosa.resample(y, orig_sr=sr0, target_sr=TARGET_SR)
-
     y, _ = librosa.effects.trim(y, top_db=25)
     y = y / (np.max(np.abs(y)) + 1e-8)
     y = fix_length_center(y, TARGET_SR, FIXED_DUR)
     logmel = compute_logmel(y, TARGET_SR)
-
     return y, TARGET_SR, logmel
 
 # ===============================
@@ -151,24 +149,24 @@ def extract_features_from_audio(y: np.ndarray) -> dict:
 st.set_page_config(page_title="Speech Disorder Classification", layout="centered")
 st.title("🗣️ Speech Disorder Classification")
 
-uploaded_file = st.file_uploader("Upload a WAV or audio file", type=["wav","mp3","flac"])
+uploaded_file = st.file_uploader("Upload an audio file (WAV, MP3, AAC, FLAC, etc.)", type=None)
 patient_name = st.text_input("Enter patient name:")
 
 if uploaded_file and patient_name:
-    fp = Path("uploads") / uploaded_file.name
-    fp.parent.mkdir(parents=True, exist_ok=True)
-    with open(fp, "wb") as f:
-        f.write(uploaded_file.getbuffer())
+    # تحويل أي ملف صوتي لـ WAV تلقائيًا
+    audio_bytes = io.BytesIO(uploaded_file.read())
+    y, sr = librosa.load(audio_bytes, sr=None, mono=True)
 
-    y, sr, logmel = preprocess_audio(str(fp))
-
-    # Save cleaned WAV and log-mel
     out_base = f"{patient_name}_{Path(uploaded_file.name).stem}"
     out_wav = WAV_DIR / f"{out_base}.wav"
-    out_mel = MEL_DIR / f"{out_base}.npy"
     sf.write(out_wav, y, sr)
+
+    # preprocessing و log-mel
+    y, sr, logmel = preprocess_audio(str(out_wav))
+    out_mel = MEL_DIR / f"{out_base}.npy"
     np.save(out_mel, logmel)
 
+    # feature extraction
     features = extract_features_from_audio(y)
     X = pd.DataFrame([features])
     for col in top_features:
@@ -176,11 +174,12 @@ if uploaded_file and patient_name:
             X[col] = 0.0
     X = X[top_features]
 
+    # prediction
     probas = model.predict_proba(X)[0]
     pred_idx = np.argmax(probas)
     pred_label = label_encoder.inverse_transform([pred_idx])[0]
 
-    # Display result only (no plots)
+    # display result only
     st.markdown(f"## Prediction for **{patient_name}**")
     st.write(f"**File:** {uploaded_file.name}")
     st.write(f"**Predicted label:** {pred_label}")
